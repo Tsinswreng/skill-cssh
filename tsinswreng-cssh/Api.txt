@@ -1,0 +1,558 @@
+using System.Diagnostics;
+using System.IO.Pipelines;
+
+namespace Tsinswreng.CsSh;
+
+/// 一条尚未启动的外部命令。
+/// Cmd 创建该对象不会执行进程；首次异步读取 Result.Stdout、Result.Stderr，或等待 Done 时才启动一次。
+/// 命令实现会同时排空 stdout 与 stderr，防止调用方暂未消费其中一条流时造成子进程 pipe 阻塞。
+public sealed partial class Command:IDisposable,IAsyncDisposable{
+	public readonly CommandRunOptions Options;
+	public readonly Pipe StdoutPipe = new(new PipeOptions(pauseWriterThreshold: long.MaxValue, resumeWriterThreshold: long.MaxValue - 1));
+	public readonly Pipe StderrPipe = new(new PipeOptions(pauseWriterThreshold: long.MaxValue, resumeWriterThreshold: long.MaxValue - 1));
+	public readonly TaskCompletionSource<CommandExit> ExitSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	public readonly object Gate = new();
+	public Task? StartTask;
+	public Process? Process;
+	public bool IsDisposed;
+	/// 僅供 Sh 以完整執行配置建立命令。
+	Command(CommandRunOptions Options);
+
+	/// 命令产生的两条标准输出流。
+	public CommandResult Result{get;}
+
+	/// 等待子进程退出并取得退出结果。
+	/// Cmd 创建的命令以非零退出码结束时，此任务抛出 CommandFailedException；TryCmd 创建的命令始终返回结果。
+	public Task<CommandExit> Done{
+		get{
+			EnsureStarted();
+			return ExitTask;
+		}
+	}
+
+	/// 尚未觀察命令時也可被釋放；實作以此欄位保存唯一的退出工作。
+	public readonly Task<CommandExit> ExitTask;
+
+	/// 让 await Command 等价于 await Command.Done。
+	/// 等待该对象会启动命令，但不会自动转送 Result 中的输出；要转送时使用 Out。
+	System.Runtime.CompilerServices.TaskAwaiter<CommandExit> GetAwaiter();
+
+	/// 非同步消費命令結果：stdout 寫入 Sh.Stdout，stderr 寫入 Sh.Stderr，並等待命令退出。
+	Task<CommandExit> Out(CT Ct);
+
+	/// 非同步消費命令結果：stdout 與 stderr 都寫入 Target，並等待命令退出。
+	Task<CommandExit> Out(Content Target, CT Ct);
+
+	/// 非同步消費命令結果：stdout 與 stderr 都覆寫寫入 TargetPath，並等待命令退出。
+	/// 這是腳本將整條命令輸出寫入檔案的簡寫；TargetPath 的父目錄會自動建立。
+	Task<CommandExit> Out(Pth TargetPath, CT Ct);
+
+	/// 非同步消費命令結果：分別指定 stdout 與 stderr 的輸出目標，並等待命令退出。
+	Task<CommandExit> Out(Content Stdout, Content Stderr, CT Ct);
+
+	/// 完整讀取 stdout 與 stderr 文字，並等待命令退出。
+	/// 這是終端消費操作，適用於 JSON、版本資訊等有限輸出；大量輸出應直接消費 Result 中的 Content 流。
+	Task<CommandTextResult> Text(CT Ct);
+
+	/// 释放结果流的临时资源；进程尚未结束时同时终止该进程。
+	void Dispose();
+
+	/// 异步释放结果流的临时资源；进程尚未结束时同时终止该进程。
+	ValueTask DisposeAsync();
+}
+
+/// 建立 Command 時的可選配置。
+/// Input 為命令的外部標準輸入來源；Cwd 指定子進程工作目錄。
+public sealed record CommandOptions(
+	Content? Input = null,
+	Pth? Cwd = null,
+	IReadOnlyDictionary<str, str?>? Env = null);
+
+/// Command 的內部執行配置。
+public sealed record CommandRunOptions(
+	str Exe,
+	IReadOnlyList<str> Args,
+	CommandOptions Options,
+	Pth Cwd,
+	IReadOnlyDictionary<str, str> Environment,
+	Content Stdout,
+	Content Stderr,
+	CT Ct,
+	bool ThrowOnError);
+
+/// Command 产生的标准输出。
+/// 两条 Stream 均为只读、惰性流：首次 ReadAsync 会启动所属命令；数据边产生边可读，不预先全部载入内存。
+public sealed record CommandResult(
+	Content Stdout,
+	Content Stderr);
+
+/// 完整消費命令文字輸出後取得的結構化結果。
+/// Stdout 與 Stderr 各自保留，Exit 保留退出碼、耗時與成功狀態。
+public sealed record CommandTextResult(
+	str Stdout,
+	str Stderr,
+	CommandExit Exit);
+
+/// 子进程退出后的结构化结果。
+public sealed record CommandExit(
+	i32 ExitCode,
+	TimeSpan Duration,
+	bool IsSuccess);
+
+/// Sh.Cmd 遇到非零退出码时抛出的异常。
+public sealed partial class CommandFailedException:Exception{
+	/// 失败命令退出时的结果。
+	public CommandExit Exit{get;}
+
+	/// 由失败命令及执行结果创建异常。
+	CommandFailedException(CommandExit Exit);
+}
+using System.Text;
+
+namespace Tsinswreng.CsSh;
+
+/// CsSh 的統一資料載體。
+/// 一個 Content 包裝一條可讀或可寫的資料流；它可由文字或普通 Stream 隱式建立，
+/// 因此檔案、命令與標準輸入輸出 API 都只需要處理 Content。
+/// Content 是一次性資料：轉成 string、讀取其 Stream，或作為 Write 的來源都會推進底層位置。
+public sealed partial class Content:IDisposable,IAsyncDisposable{
+	/// 此 Content 所包裝的普通 .NET Stream。
+	/// 取得它不複製資料，也不重設目前讀寫位置。
+	public Stream Stream{get;}
+
+	/// 建立時的文字編碼與底層 Stream 所有權設定。
+	public ContentOptions Options{get;}
+
+	/// First text consumption is shared by synchronous and asynchronous callers.
+	private Task<str>? TextTask;
+
+	/// 從普通 .NET Stream 建立 Content。
+	Content(Stream Stream, ContentOptions? Options = null);
+
+	/// 將文字編碼為 Content；預設 UTF-8。
+	public static implicit operator Content(str Text) {
+		ArgumentNullException.ThrowIfNull(Text);
+		var Bytes = Encoding.UTF8.GetBytes(Text);
+		return new(new MemoryStream(Bytes, writable: false), new(LeaveOpen: false));
+	}
+
+	/// 將普通 .NET Stream 包裝為 Content，不預先讀取或複製資料。
+	public static implicit operator Content(Stream Stream) {
+		return new(Stream);
+	}
+
+	/// 同步讀完 Content 並按設定編碼解碼為文字。
+	/// 這會消費 Content；需要非同步讀取時使用 Text(Ct)。
+	public static implicit operator str(Content Value) {
+		ArgumentNullException.ThrowIfNull(Value);
+		return Value.Text();
+	}
+
+	/// 取出 Content 的底層普通 Stream，不複製資料。
+	public static implicit operator Stream(Content Value) {
+		ArgumentNullException.ThrowIfNull(Value);
+		return Value.Stream;
+	}
+
+	/// 同步讀完並解碼為文字。
+	str Text();
+
+	/// 非同步讀完並解碼為文字；Ct 必須作為最後一個位置參數傳入。
+	Task<str> Text(CT Ct);
+
+	/// 釋放 Content 擁有的底層資源；不擁有的外部 Stream 不會被關閉。
+	void Dispose();
+
+	/// 非同步釋放 Content 擁有的底層資源；不擁有的外部 Stream 不會被關閉。
+	ValueTask DisposeAsync();
+}
+
+/// Content 的建立選項。
+/// Encoding 控制 string 與 Content 的互轉；LeaveOpen 為 true 時 Content 釋放後保留呼叫方提供的 Stream。
+public sealed record ContentOptions(
+	Encoding? Encoding = null,
+	bool LeaveOpen = true);
+namespace Tsinswreng.CsSh;
+
+class Sh{
+	/// 取得当前进程的环境变量；不存在时返回 null。
+	str? GetEnv(str Name);
+
+	/// 设置当前进程的环境变量。
+	/// 若只需影响一次外部调用，应在创建 X 命令时传入专用环境变量设置，避免污染脚本后续步骤。
+	void SetEnv(str Name, str Value);
+
+	/// 从当前进程的环境变量中移除指定名称。
+	void UnsetEnv(str Name);
+}
+namespace Tsinswreng.CsSh;
+
+/// Adds the path-join operator to ordinary strings for Cssh scripts.
+/// The result always uses forward slashes, so it can be supplied unchanged to every Cssh path API.
+public static class ExtnString{
+	/// Extends string without introducing a wrapper type at script call sites.
+	extension(str z){
+		/// Joins two path segments without duplicating the separator at their boundary.
+		/// An empty segment is ignored; a leading slash in B is treated as a separator rather than a new rooted path.
+		public static Pth operator /(str A, str B){
+			return Pth.Join(A, B);
+		}
+	}
+}
+namespace Tsinswreng.CsSh;
+
+/// Cp 的可选行为。
+public sealed record CpOptions(
+	bool Overwrite = false);
+
+/// Mv 的可选行为。
+public sealed record MvOptions(
+	bool Overwrite = false);
+
+/// Ls 的可选行为。
+public sealed record LsOptions(
+	bool Recursive = false);
+
+/// 供 csx 构建脚本直接静态导入的文件系统动词。
+/// 每个路径均由 .NET 负责平台适配，不依赖 Bash、PowerShell 或外部 coreutils。
+/// 调用方可统一使用正斜杠，例如 Rm("artifacts/publish")；无需调用 Path.Combine。
+class Sh{
+	/// 判断路径是否存在，可以是文件或目录。
+	bool Exists(Pth Path);
+
+	/// 异步判断路径是否存在；Ct 必须作为最后一个位置参数传入。
+	Task<bool> Exists(Pth Path, CT Ct);
+
+	/// 取得文件或目录的 .NET 文件系统信息；路径不存在时返回 null。
+	/// 文件返回 FileInfo，目录返回 DirectoryInfo；其余属性直接使用 BCL 成员读取。
+	FileSystemInfo? FsInfo(Pth Path);
+
+	/// 异步取得文件或目录的 .NET 文件系统信息；路径不存在时返回 null。
+	Task<FileSystemInfo?> FsInfo(Pth Path, CT Ct);
+
+	/// 判断路径是否为普通文件；不存在时返回 false。
+	/// 与 FsInfo 一样，遇到真实的文件系统访问错误会抛出异常。
+	bool IsFile(Pth Path);
+
+	/// 异步判断路径是否为普通文件；不存在时返回 false。
+	Task<bool> IsFile(Pth Path, CT Ct);
+
+	/// 判断路径是否为目录；不存在时返回 false。
+	/// 与 FsInfo 一样，遇到真实的文件系统访问错误会抛出异常。
+	bool IsDir(Pth Path);
+
+	/// 异步判断路径是否为目录；不存在时返回 false。
+	Task<bool> IsDir(Pth Path, CT Ct);
+
+	/// 建立目录及所有缺失的父目录；已存在时不报错。
+	void Mkdir(Pth Path);
+
+	/// 异步建立目录；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Mkdir(Pth Path, CT Ct);
+
+	/// 删除文件，或递归删除目录。
+	/// 固定等价于 Bash 的 rm -rf：目标不存在时忽略，绝不交互确认；权限不足等真实文件系统错误仍会抛出。
+	void Rm(Pth Path);
+
+	/// 异步删除文件或目录；语义与同步 Rm 相同，Ct 必须作为最后一个位置参数传入。
+	Task<nil> Rm(Pth Path, CT Ct);
+
+	/// 复制文件，或递归复制整个目录树。
+	/// Source 也可为 glob；例如 Cp("ExternalRsrc/*", "output") 等价于 Bash 的 cp -r ExternalRsrc/* output。
+	void Cp(Pth Source, Pth Destination, CpOptions? Options = null);
+
+	/// 异步复制文件、目录或 glob 匹配项；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Cp(Pth Source, Pth Destination, CT Ct);
+
+	/// 异步复制文件或目录；需要覆写既有目标时传入 Options；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Cp(Pth Source, Pth Destination, CpOptions? Options, CT Ct);
+
+	/// 移动文件或目录；Overwrite 控制目标已存在时是否替换。
+	void Mv(Pth Source, Pth Destination, MvOptions? Options = null);
+
+	/// 异步移动文件或目录；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Mv(Pth Source, Pth Destination, CT Ct);
+
+	/// 异步移动文件或目录；需要覆写既有目标时传入 Options；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Mv(Pth Source, Pth Destination, MvOptions? Options, CT Ct);
+	
+	/// 取得路徑的最後一段檔案或目錄名稱，等價於 Bash basename。
+	Pth BaseName(Pth Path);
+
+	/// 取得路徑的父目錄部分，等價於 Bash dirname。
+	Pth DirName(Pth Path);
+
+	/// 依此 Sh 的目前工作目錄展開為絕對、規範化路徑。
+	/// 不要求目標存在，且不解析符號連結；等價於 System.IO.Path.GetFullPath。
+	Pth FullPath(Pth Path);
+
+/// 惰性查找匹配的文件系统项目；这是递归枚举加 glob 过滤，不是 Bash find 条件表达式。
+	/// Pattern 是跨平台 glob 路径，支持 /、*、? 与 **；例如 Glob("src/**/*.csproj")。
+	/// 返回 .NET 的 FileSystemInfo；文件为 FileInfo、目录为 DirectoryInfo。
+/// 可直接读取 Attributes、LastWriteTimeUtc 等 BCL 属性；文件大小使用 FileInfo.Length。
+IEnumerable<FileSystemInfo> Glob(Pth Pattern);
+
+	/// 异步查找匹配的文件系统项目；Ct 必须作为最后一个位置参数传入。
+IAsyncEnumerable<FileSystemInfo> Glob(Pth Pattern, CT Ct);
+
+	/// 惰性列出目录中的子项，等价于 Bash 的 ls。
+	/// 返回 .NET 的 FileSystemInfo；Path 为 null 时列出当前目录；Recursive 为 false 时仅列出直接子项。
+	IEnumerable<FileSystemInfo> Ls(Pth? Path = null, LsOptions? Options = null);
+
+	/// 异步列出目录中的子项；Ct 必须作为最后一个位置参数传入。
+	IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, CT Ct);
+
+	/// 异步列出目录中的子项；需要递归列出时传入 Options；Ct 必须作为最后一个位置参数传入。
+	IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, LsOptions? Options, CT Ct);
+
+	/// 讀取檔案為 Content；呼叫方可將結果隱式視為 string 或普通 Stream。
+	Content Read(Pth Path);
+
+	/// 非同步讀取檔案為 Content；Ct 必須作為最後一個位置參數傳入。
+	Task<Content> Read(Pth Path, CT Ct);
+
+	/// 覆寫檔案內容，等價於 > Path。
+	/// Source 接受 Content；string 與普通 Stream 均可隱式轉入 Content。
+	void Write(Pth Path, Content Source);
+
+	/// 以字串路徑覆寫檔案內容。
+	/// 此重載優先保留 Write("file", "text") 的腳本寫法，避免與 Content 目標寫入重載二義。
+	void Write(str Path, Content Source);
+
+	/// 非同步覆寫檔案內容；Ct 必須作為最後一個位置參數傳入。
+	Task<nil> Write(Pth Path, Content Source, CT Ct);
+
+	/// 以字串路徑非同步覆寫檔案內容；Ct 必須作為最後一個位置參數傳入。
+	Task<nil> Write(str Path, Content Source, CT Ct);
+
+	/// 追加檔案內容，等價於 >> Path。
+	/// Source 接受 Content；string 與普通 Stream 均可隱式轉入 Content。
+	void Append(Pth Path, Content Source);
+
+	/// 以字串路徑追加檔案內容。
+	void Append(str Path, Content Source);
+
+	/// 非同步追加檔案內容；Ct 必須作為最後一個位置參數傳入。
+	Task<nil> Append(Pth Path, Content Source, CT Ct);
+
+	/// 以字串路徑非同步追加檔案內容；Ct 必須作為最後一個位置參數傳入。
+	Task<nil> Append(str Path, Content Source, CT Ct);
+}
+namespace Tsinswreng.CsSh;
+
+/// 表示供 Cssh API 使用的檔案系統路徑。
+/// 此類型保留與 string 的隱式互轉，以維持腳本中既有的字面量呼叫方式。
+public readonly partial struct Pth{
+	/// 路徑的原始字串值。
+	public str Value{get;}
+
+	/// 以原始字串建立路徑。
+	Pth(str Value);
+
+	/// 取得供 BCL 與一般文字 API 使用的原始路徑值。
+	/// C# 不支援 partial conversion operator，故此處僅作語法層轉發。
+	public static implicit operator str(Pth z) {
+		return z.Value;
+	}
+
+	/// 讓既有字串字面量可直接傳入 Cssh 的路徑 API。
+	/// C# 不支援 partial conversion operator，故此處僅轉發至已分離的建構子。
+	public static implicit operator Pth(str z) {
+		return new Pth(z);
+	}
+
+	/// 將右側路徑片段附加到目前路徑，並統一使用正斜線。
+	/// C# 不支援 partial operator，故此處僅轉發至已分離的 Join。
+	public static Pth operator /(Pth A, str B) {
+		return Join(A.Value, B);
+	}
+
+	/// 將兩個路徑附加為一條 Cssh 路徑。
+	/// C# 不支援 partial operator，故此處僅轉發至已分離的 Join。
+	public static Pth operator /(Pth A, Pth B) {
+		return Join(A.Value, B.Value);
+	}
+
+	/// 對兩段路徑做不改變根語意的字串層級連接。
+	static Pth Join(str A, str B);
+
+	/// 以原始路徑值表示此實例，供記錄與插值字串使用。
+	public override partial str ToString();
+}
+namespace Tsinswreng.CsSh;
+
+/// Cssh 的一个脚本上下文实例。
+/// 每个实例拥有自己的当前目录与标准流；脚本通常通过 ShGlobal 的 using static facade 使用默认实例。
+class Sh{
+	/// 建立一个以当前进程目录为初始目录的 Shell 上下文。
+	Sh();
+
+	/// 当前脚本进程的标准输入内容。
+	public Content Stdin{get;}
+
+	/// 当前脚本进程的标准输出内容。
+	public Content Stdout{get;}
+
+	/// 当前脚本进程的标准错误内容。
+	public Content Stderr{get;}
+
+	/// 跨平台的空内容目标，等价于 Bash 的 /dev/null 或 Windows 的 NUL。
+	public Content Null{get;}
+
+	/// 取得当前进程的工作目录。
+	/// 返回路径统一使用正斜杠，因而可直接与 Cssh 的所有路径 API 拼接。
+	Pth Pwd();
+
+	/// 取得当前 csx 脚本所在的目录。
+	/// 与 Pwd 不同：无论调用者从哪个工作目录启动 dotnet script，此值均指向脚本文件的父目录。
+	/// 返回路径统一使用正斜杠。
+	Pth CsxDir();
+
+	/// 同步输出一行文本到标准输出，等价于 Bash 的 echo。
+	void Echo(str Text);
+
+	/// 异步输出一行文本到标准输出。
+	Task<nil> Echo(str Text, CT Ct);
+
+	/// 切换当前进程的工作目录，等价于 Bash 的 cd。
+	/// Cssh 的所有路径参数均接受正斜杠；例如 Cd("src/app") 在 Windows、Linux 与 macOS 上含义相同。
+	/// 此变更影响后续相对路径和未显式传入 Cwd 的 X 命令。
+	void Cd(Pth Path);
+
+	/// 建立尚未啟動的命令；Args 的每一項是一個完整參數，不需呼叫方處理引號或跳脫。
+	Command Cmd(str Exe, IList<str> Args);
+
+	/// 建立尚未啟動的命令；Args 的每一項是一個完整參數。
+	Command Cmd(str Exe, IList<str> Args, CommandOptions Options);
+
+	/// 非同步建立尚未啟動的命令；Ct 必須作為最後一個位置參數。
+	Command Cmd(str Exe, IList<str> Args, CT Ct);
+
+	/// 非同步建立尚未啟動的命令；Args 的每一項是一個完整參數，Ct 必須作為最後一個位置參數。
+	Command Cmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+
+	/// 建立不因非零退出碼丟例外的命令；Args 的每一項是一個完整參數。
+	Command TryCmd(str Exe, IList<str> Args);
+
+	/// 建立帶可選設定且不因非零退出碼丟例外的命令。
+	Command TryCmd(str Exe, IList<str> Args, CommandOptions Options);
+
+	/// 非同步建立不因非零退出碼丟例外的命令；Ct 必須作為最後一個位置參數。
+	Command TryCmd(str Exe, IList<str> Args, CT Ct);
+
+	/// 非同步建立帶可選設定且不因非零退出碼丟例外的命令；Ct 必須作為最後一個位置參數。
+	Command TryCmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+
+	/// 執行以參數列表描述的命令；Args 不需呼叫方處理引號或跳脫。
+	CommandExit Exe(str FileName, IList<str> Args);
+
+	/// 以可選設定執行參數列表命令。
+	CommandExit Exe(str FileName, IList<str> Args, CommandOptions Options);
+
+	/// 非同步執行參數列表命令；Ct 必須作為最後一個位置參數。
+	Task<CommandExit> Exe(str FileName, IList<str> Args, CT Ct);
+
+	/// 非同步以可選設定執行參數列表命令；Ct 必須作為最後一個位置參數。
+	Task<CommandExit> Exe(str FileName, IList<str> Args, CommandOptions Options, CT Ct);
+
+	/// 執行參數列表命令；非零退出碼回傳 CommandExit，不丟例外。
+	CommandExit TryExe(str FileName, IList<str> Args);
+
+	/// 以可選設定執行參數列表命令；非零退出碼不丟例外。
+	CommandExit TryExe(str FileName, IList<str> Args, CommandOptions Options);
+
+	/// 非同步執行參數列表命令；非零退出碼不丟例外。
+	Task<CommandExit> TryExe(str FileName, IList<str> Args, CT Ct);
+
+	/// 非同步以可選設定執行參數列表命令；非零退出碼不丟例外。
+	Task<CommandExit> TryExe(str FileName, IList<str> Args, CommandOptions Options, CT Ct);
+
+	/// 將一個值轉成可嵌入字串命令的單一安全參數。
+	/// 新程式優先使用 Args 列表重載；Q 適用於保留 Bash 風格命令字串的腳本。
+	str Q(str Value);
+
+	/// 非同步地将 Source 复制到 Target。
+	/// 读取命令的 Result.Stdout 或 Result.Stderr 会触发命令执行；Source 结束时不会关闭调用方提供的 Target。
+	void Write(Content Target, Content Source);
+
+	/// 非同步地将 Source 复制到 Target；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Write(Content Target, Content Source, CT Ct);
+
+	/// 非同步合并多条 Source 流并写入同一 Target。
+	/// Cssh 串行化对 Target 的写入，因此可安全实现 stdout 与 stderr 合并，而不并发写同一 Stream。
+	void Write(Content Target, IReadOnlyList<Content> Sources);
+
+	/// 非同步合并多条 Source 流并写入同一 Target；Ct 必须作为最后一个位置参数传入。
+	Task<nil> Write(Content Target, IReadOnlyList<Content> Sources, CT Ct);
+}
+namespace Tsinswreng.CsSh;
+
+/// 全局默认 Shell 实例的静态 facade，供 csx 使用 using static 简化调用。
+static class ShGlobal{
+	public static Sh Sh{get;set;} = new();
+	static Pth Pwd();
+	static Pth CsxDir();
+	static void Echo(str Text);
+	static Task<nil> Echo(str Text, CT Ct);
+	static void Cd(Pth Path);
+	static Command Cmd(str Exe, IList<str> Args);
+	static Command Cmd(str Exe, IList<str> Args, CommandOptions Options);
+	static Command Cmd(str Exe, IList<str> Args, CT Ct);
+	static Command Cmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+	static Command TryCmd(str Exe, IList<str> Args);
+	static Command TryCmd(str Exe, IList<str> Args, CommandOptions Options);
+	static Command TryCmd(str Exe, IList<str> Args, CT Ct);
+	static Command TryCmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+	static CommandExit Exe(str Exe, IList<str> Args);
+	static CommandExit Exe(str Exe, IList<str> Args, CommandOptions Options);
+	static Task<CommandExit> Exe(str Exe, IList<str> Args, CT Ct);
+	static Task<CommandExit> Exe(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+	static CommandExit TryExe(str Exe, IList<str> Args);
+	static CommandExit TryExe(str Exe, IList<str> Args, CommandOptions Options);
+	static Task<CommandExit> TryExe(str Exe, IList<str> Args, CT Ct);
+	static Task<CommandExit> TryExe(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+	static str Q(str Value);
+	static void Write(Content Target, Content Source);
+	static Task<nil> Write(Content Target, Content Source, CT Ct);
+	static void Write(Content Target, IReadOnlyList<Content> Sources);
+	static Task<nil> Write(Content Target, IReadOnlyList<Content> Sources, CT Ct);
+	static str? GetEnv(str Name);
+	static void SetEnv(str Name, str Value);
+	static void UnsetEnv(str Name);
+	static bool Exists(Pth Path);
+	static Task<bool> Exists(Pth Path, CT Ct);
+	static FileSystemInfo? FsInfo(Pth Path);
+	static Task<FileSystemInfo?> FsInfo(Pth Path, CT Ct);
+	static bool IsFile(Pth Path);
+	static Task<bool> IsFile(Pth Path, CT Ct);
+	static bool IsDir(Pth Path);
+	static Task<bool> IsDir(Pth Path, CT Ct);
+	static void Mkdir(Pth Path);
+	static Task<nil> Mkdir(Pth Path, CT Ct);
+	static void Rm(Pth Path);
+	static Task<nil> Rm(Pth Path, CT Ct);
+	static void Cp(Pth Source, Pth Destination, CpOptions? Options = null);
+	static Task<nil> Cp(Pth Source, Pth Destination, CT Ct);
+	static Task<nil> Cp(Pth Source, Pth Destination, CpOptions? Options, CT Ct);
+	static void Mv(Pth Source, Pth Destination, MvOptions? Options = null);
+	static Task<nil> Mv(Pth Source, Pth Destination, CT Ct);
+	static Task<nil> Mv(Pth Source, Pth Destination, MvOptions? Options, CT Ct);
+	static Pth BaseName(Pth Path);
+	static Pth DirName(Pth Path);
+	static Pth RealPath(Pth Path);
+	static IEnumerable<FileSystemInfo> Glob(Pth Pattern);
+	static IAsyncEnumerable<FileSystemInfo> Glob(Pth Pattern, CT Ct);
+	static IEnumerable<FileSystemInfo> Ls(Pth? Path = null, LsOptions? Options = null);
+	static IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, CT Ct);
+	static IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, LsOptions? Options, CT Ct);
+	static Content Read(Pth Path);
+	static Task<Content> Read(Pth Path, CT Ct);
+	static void Write(Pth Path, Content Source);
+	static void Write(str Path, Content Source);
+	static Task<nil> Write(Pth Path, Content Source, CT Ct);
+	static Task<nil> Write(str Path, Content Source, CT Ct);
+	static void Append(Pth Path, Content Source);
+	static void Append(str Path, Content Source);
+	static Task<nil> Append(Pth Path, Content Source, CT Ct);
+	static Task<nil> Append(str Path, Content Source, CT Ct);
+}
