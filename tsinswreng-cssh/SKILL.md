@@ -20,13 +20,25 @@ namespace Tsinswreng.CsSh;
 /// Cmd 创建该对象不会执行进程；首次异步读取 Result.Stdout、Result.Stderr，或等待 Done 时才启动一次。
 /// 命令实现会同时排空 stdout 与 stderr，防止调用方暂未消费其中一条流时造成子进程 pipe 阻塞。
 public sealed partial class Command:IDisposable,IAsyncDisposable{
+	/// 未指定 CommandOptions.PipeBufferSizeBytes 時，每一條 stdout 或 stderr Pipe 使用的預設容量。
+	/// 此值限制每條輸出在消費者尚未讀取時可暫存的資料量；兩條 Pipe 各自使用此容量。
+	public const i64 DefaultPipeBufferSizeBytes = 64 * 1024;
+
+	/// 建立命令時凍結的可執行檔、參數、工作目錄、環境、標準流與錯誤策略。
 	public readonly CommandRunOptions Options;
-	public readonly Pipe StdoutPipe = new(new PipeOptions(pauseWriterThreshold: long.MaxValue, resumeWriterThreshold: long.MaxValue - 1));
-	public readonly Pipe StderrPipe = new(new PipeOptions(pauseWriterThreshold: long.MaxValue, resumeWriterThreshold: long.MaxValue - 1));
+	/// 接收子程序標準輸出的暫存管線；讀取 Result.Stdout 時由此取得資料。
+	public readonly Pipe StdoutPipe;
+	/// 接收子程序標準錯誤的暫存管線；讀取 Result.Stderr 時由此取得資料。
+	public readonly Pipe StderrPipe;
+	/// 儲存唯一的命令退出結果或執行例外，避免多個觀察者重複完成任務。
 	public readonly TaskCompletionSource<CommandExit> ExitSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	/// 保護啟動、釋放與 Process 欄位的同步鎖，避免命令被並行啟動或釋放。
 	public readonly object Gate = new();
+	/// 唯一的背景啟動工作；null 代表命令尚未被觀察，因而尚未啟動。
 	public Task? StartTask;
+	/// 已啟動的 .NET Process；完成或釋放後設為 null，避免持有原生控制代碼。
 	public Process? Process;
+	/// 標示 Command 已釋放；釋放後不得再啟動新的子程序。
 	public bool IsDisposed;
 	/// 僅供 Sh 以完整執行配置建立命令。
 	Command(CommandRunOptions Options);
@@ -54,6 +66,7 @@ public sealed partial class Command:IDisposable,IAsyncDisposable{
 	Task<CommandExit> Out(CT Ct);
 
 	/// 非同步消費命令結果：stdout 與 stderr 都寫入 Target，並等待命令退出。
+	/// 兩條流會並行讀取、分段序列化寫入，因此有限 Pipe 不會因其中一條暫未被讀取而卡住。
 	Task<CommandExit> Out(Content Target, CT Ct);
 
 	/// 非同步消費命令結果：stdout 與 stderr 都覆寫寫入 TargetPath，並等待命令退出。
@@ -72,44 +85,104 @@ public sealed partial class Command:IDisposable,IAsyncDisposable{
 
 	/// 异步释放结果流的临时资源；进程尚未结束时同时终止该进程。
 	ValueTask DisposeAsync();
+
+	/// 同時讀取 stdout 與 stderr，並將各資料區塊序列化寫入同一目標。
+	private partial Task<CommandExit> OutMerged(Content Target, CT Ct);
+
+	/// 確保命令只會啟動一次；由結果資料流的讀取包裝呼叫。
+	internal partial void EnsureStarted();
+
+	/// 啟動外部進程、轉送各條資料流並完成退出結果。
+	private partial Task Start();
+
+	/// 根據命令執行設定建立不經 Shell 解譯的 ProcessStartInfo。
+	private partial ProcessStartInfo MakeStartInfo();
+
+	/// 將可選標準輸入來源複製至已啟動進程。
+	private partial Task CopyInput(Process Process);
+
+	/// 確保標準輸入在正常完成或失敗時都被關閉，讓子進程能觀察到 EOF。
+	private partial Task CloseInput(Process Process);
+
+	/// 將一條 Content 資料流複製至目標。
+	private static partial Task Write(Content Target, Content Source, CT Ct);
+
+	/// 同時讀取多條來源，並以每個資料區塊為單位序列化寫入同一目標。
+	private static partial Task WriteMerged(Content Target, IReadOnlyList<Content> Sources, CT Ct);
+
+	/// 依指定的單條 Pipe 容量建立具備背壓的 PipeOptions。
+	private static partial PipeOptions MkPipeOptions(i64? PipeBufferSizeBytes);
+
+	/// 完成 stdout 與 stderr 管線，並將啟動或轉送失敗傳遞給讀取端。
+	private partial Task CompletePipes(Exception? Error = null);
+
+	/// 終止仍在執行中的子進程。
+	private partial void TryKill();
+
+	/// 釋放已建立的 Process 控制代碼；輸出管線完成後才可呼叫。
+	private partial void DisposeProcess();
 }
 
 /// 建立 Command 時的可選配置。
-/// Input 為命令的外部標準輸入來源；Cwd 指定子進程工作目錄。
+/// 每個設定只影響本次命令；不會改變 Sh 實例或目前程序的全域狀態。
 public sealed record CommandOptions(
-	Content? Input = null,
+	/// 子程序的標準輸入來源；null 代表不重定向 stdin，子程序沿用宿主程序的標準輸入。
+	Content? Stdin = null,
+	/// 子程序工作目錄；null 時使用建立此 Command 的 Sh 目前工作目錄。
 	Pth? Cwd = null,
-	IReadOnlyDictionary<str, str?>? Env = null);
+	/// 僅套用於子程序的環境變數覆寫；鍵的值為 null 時從子程序環境移除該鍵。
+	IReadOnlyDictionary<str, str?>? Env = null,
+	/// 每一條 stdout 或 stderr Pipe 的最大暫存位元組數；null 時使用 Command.DefaultPipeBufferSizeBytes。
+	/// 此值必須大於 0；Pipe 滿時會以背壓暫停上游輸出，而非無限制佔用記憶體。
+	i64? PipeBufferSizeBytes = null);
 
 /// Command 的內部執行配置。
+/// 此 record 在建立 Command 時完成快照，避免呼叫端在命令啟動前修改參數或環境集合而改變行為。
 public sealed record CommandRunOptions(
+	/// 要啟動的可執行檔名稱或路徑；不經由 Shell 字串解析。
 	str Exe,
+	/// 子程序參數；每個元素是一個完整參數，會直接加入 ProcessStartInfo.ArgumentList。
 	IReadOnlyList<str> Args,
+	/// 呼叫端提供的選用設定；保留 stdin 來源與原始選項供命令生命週期使用。
 	CommandOptions Options,
+	/// 已展開為絕對路徑的子程序工作目錄。
 	Pth Cwd,
+	/// 建立命令當下取得的子程序環境快照；不會受後續宿主環境變更影響。
 	IReadOnlyDictionary<str, str> Environment,
+	/// Exe 或 Command.Out() 未指定目標時接收子程序 stdout 的預設 Content。
 	Content Stdout,
+	/// Exe 或 Command.Out() 未指定目標時接收子程序 stderr 的預設 Content。
 	Content Stderr,
+	/// 取消命令啟動、資料轉送與等待的取消令牌。
 	CT Ct,
+	/// true 時非零退出碼會讓 Done 以 CommandFailedException 失敗；false 時回傳失敗的 CommandExit。
 	bool ThrowOnError);
 
 /// Command 产生的标准输出。
 /// 两条 Stream 均为只读、惰性流：首次 ReadAsync 会启动所属命令；数据边产生边可读，不预先全部载入内存。
 public sealed record CommandResult(
+	/// 子程序標準輸出；只能按 Stream 的一次性消費規則讀取。
 	Content Stdout,
+	/// 子程序標準錯誤；只能按 Stream 的一次性消費規則讀取。
 	Content Stderr);
 
 /// 完整消費命令文字輸出後取得的結構化結果。
 /// Stdout 與 Stderr 各自保留，Exit 保留退出碼、耗時與成功狀態。
 public sealed record CommandTextResult(
+	/// 完整消費 stdout 後以文字解碼得到的內容；只適合有限大小輸出。
 	str Stdout,
+	/// 完整消費 stderr 後以文字解碼得到的內容；只適合有限大小輸出。
 	str Stderr,
+	/// 命令退出碼、耗時及成功狀態。
 	CommandExit Exit);
 
 /// 子进程退出后的结构化结果。
 public sealed record CommandExit(
+	/// 子程序回報的原始退出碼；0 代表成功。
 	i32 ExitCode,
+	/// 從 Process.Start 成功到子程序退出的耗時。
 	TimeSpan Duration,
+	/// ExitCode 是否為 0 的便利判斷值。
 	bool IsSuccess);
 
 /// Sh.Cmd 遇到非零退出码时抛出的异常。
@@ -119,6 +192,43 @@ public sealed partial class CommandFailedException:Exception{
 
 	/// 由失败命令及执行结果创建异常。
 	CommandFailedException(CommandExit Exit);
+}
+namespace Tsinswreng.CsSh;
+
+/// 讀取前啟動所屬 Command 的只讀 Stream 包裝。
+/// 包裝不緩衝資料，讀取會直接進入 PipeReader 對應的非同步 Stream。
+internal sealed partial class CommandReadStream:Stream{
+	/// 實際承載命令輸出資料的 PipeReader Stream。
+	private readonly Stream Inner;
+	/// 首次讀取時啟動所屬命令的回呼。
+	private readonly Action Start;
+
+	/// 建立資料流包裝；不會立即啟動命令。
+	internal partial CommandReadStream(Stream Inner, Action Start);
+
+	public override bool CanRead => Inner.CanRead;
+	public override bool CanSeek => false;
+	public override bool CanWrite => false;
+	public override long Length => throw new NotSupportedException();
+	public override long Position{get => throw new NotSupportedException(); set => throw new NotSupportedException();}
+	/// 此唯讀資料流不支援同步 Flush。
+	public override partial void Flush();
+	/// 此唯讀資料流不支援非同步 Flush。
+	public override partial Task FlushAsync(CT Ct);
+	/// 啟動命令後讀取同步資料。
+	public override partial i32 Read(byte[] Buffer, i32 Offset, i32 Count);
+	/// 啟動命令後讀取同步資料。
+	public override partial i32 Read(Span<byte> Buffer);
+	/// 啟動命令後讀取非同步資料。
+	public override partial Task<i32> ReadAsync(byte[] Buffer, i32 Offset, i32 Count, CT Ct);
+	/// 啟動命令後讀取非同步資料。
+	public override partial ValueTask<i32> ReadAsync(Memory<byte> Buffer, CT Ct = default);
+	/// 此資料流不支援定位。
+	public override partial long Seek(long Offset, SeekOrigin Origin);
+	/// 此資料流不支援改變長度。
+	public override partial void SetLength(long Value);
+	/// 此資料流不支援寫入。
+	public override partial void Write(byte[] Buffer, i32 Offset, i32 Count);
 }
 using System.Text;
 
@@ -178,6 +288,15 @@ public sealed partial class Content:IDisposable,IAsyncDisposable{
 
 	/// 非同步釋放 Content 擁有的底層資源；不擁有的外部 Stream 不會被關閉。
 	ValueTask DisposeAsync();
+
+	/// 取得唯一的文字讀取工作，確保同步與非同步讀取共用同一次 Stream 消費。
+	private partial Task<str> GetTextTask(CT Ct);
+
+	/// 非同步讀取並解碼底層資料流。
+	private partial Task<str> ReadText(CT Ct);
+
+	/// 在建立文字讀取器前驗證底層資料流可讀。
+	private partial void EnsureReadable();
 }
 
 /// Content 的建立選項。
@@ -222,7 +341,8 @@ public sealed record CpOptions(
 public sealed record MvOptions(
 	bool Overwrite = false);
 
-/// Ls 的可选行为。
+/// Ls、LsDir 與 LsFile 的可选行为。
+/// Recursive 為 false 時只列出直接子項；為 true 時遞迴列出所有後代項目。
 public sealed record LsOptions(
 	bool Recursive = false);
 
@@ -289,34 +409,59 @@ class Sh{
 	/// 异步移动文件或目录；需要覆写既有目标时传入 Options；Ct 必须作为最后一个位置参数传入。
 	Task<nil> Mv(Pth Source, Pth Destination, MvOptions? Options, CT Ct);
 	
-	/// 取得路徑的最後一段檔案或目錄名稱，等價於 Bash basename。
+	/// 取得路徑的最後一段檔案或目錄名稱。
+	/// 採用 System.IO.Path 的元件擷取語義；根路徑會回傳空字串。
 	Pth BaseName(Pth Path);
 
-	/// 取得路徑的父目錄部分，等價於 Bash dirname。
+	/// 取得路徑的父目錄部分。
+	/// 採用 System.IO.Path 的元件擷取語義；沒有父目錄或僅為根路徑時回傳空字串。
 	Pth DirName(Pth Path);
 
 	/// 依此 Sh 的目前工作目錄展開為絕對、規範化路徑。
 	/// 不要求目標存在，且不解析符號連結；等價於 System.IO.Path.GetFullPath。
 	Pth FullPath(Pth Path);
 
-/// 惰性查找匹配的文件系统项目；这是递归枚举加 glob 过滤，不是 Bash find 条件表达式。
-	/// Pattern 是跨平台 glob 路径，支持 /、*、? 与 **；例如 Glob("src/**/*.csproj")。
-	/// 返回 .NET 的 FileSystemInfo；文件为 FileInfo、目录为 DirectoryInfo。
-/// 可直接读取 Attributes、LastWriteTimeUtc 等 BCL 属性；文件大小使用 FileInfo.Length。
-IEnumerable<FileSystemInfo> Glob(Pth Pattern);
+	/// 惰性查找匹配的文件系统路径；相对 Pattern 按当前 Sh 的工作目录解析。
+	/// 语法与匹配语义由 Meziantou.Framework.Globbing 的 Standard dialect 定义，支持 *、?、[]、{} 与 **。
+	/// 不以 / 结尾的模式只匹配文件；以 / 结尾的模式只匹配目录，且字面量目录如 Glob("src/assets/") 会返回该目录本身。
+	/// 返回完整 Pth，不建立 FileSystemInfo；需要类型或 metadata 时，显式调用 IsFile、IsDir 或 FsInfo。
+	/// 列举在 foreach 时才访问文件系统，所以目录不存在、权限不足等错误也会在 foreach 时抛出。
+	/// <example>
+	/// foreach (var FilePath in Glob("src/**/*.cs")) {
+	/// 	Console.WriteLine(FilePath);
+	/// }
+	/// foreach (var DirectoryPath in Glob("src/*/")) {
+	/// 	Console.WriteLine(DirectoryPath);
+	/// }
+	/// </example>
+	IEnumerable<Pth> Glob(Pth Pattern);
 
-	/// 异步查找匹配的文件系统项目；Ct 必须作为最后一个位置参数传入。
-IAsyncEnumerable<FileSystemInfo> Glob(Pth Pattern, CT Ct);
+	/// 惰性列出 Path 的文件和子目录路径，等价于 Bash 的 ls；Path 为 null 时列出当前 Sh 的工作目录。
+	/// 直接转发 Directory.EnumerateFileSystemEntries，因此只产生路径，不读取大小、时间等 metadata。
+	/// <example>
+	/// foreach (var EntryPath in Ls("artifacts")) {
+	/// 	Console.WriteLine(EntryPath);
+	/// }
+	/// </example>
+	IEnumerable<Pth> Ls(Pth? Path = null, LsOptions? Options = null);
 
-	/// 惰性列出目录中的子项，等价于 Bash 的 ls。
-	/// 返回 .NET 的 FileSystemInfo；Path 为 null 时列出当前目录；Recursive 为 false 时仅列出直接子项。
-	IEnumerable<FileSystemInfo> Ls(Pth? Path = null, LsOptions? Options = null);
+	/// 惰性列出 Path 的子目录路径；Path 为 null 时列出当前 Sh 的工作目录。
+	/// 直接转发 Directory.EnumerateDirectories；使用 new LsOptions(Recursive: true) 可递迴列出所有子目录。
+	/// <example>
+	/// foreach (var DirectoryPath in LsDir("src", new LsOptions(Recursive: true))) {
+	/// 	Console.WriteLine(DirectoryPath);
+	/// }
+	/// </example>
+	IEnumerable<Pth> LsDir(Pth? Path = null, LsOptions? Options = null);
 
-	/// 异步列出目录中的子项；Ct 必须作为最后一个位置参数传入。
-	IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, CT Ct);
-
-	/// 异步列出目录中的子项；需要递归列出时传入 Options；Ct 必须作为最后一个位置参数传入。
-	IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, LsOptions? Options, CT Ct);
+	/// 惰性列出 Path 的文件路径；Path 为 null 时列出当前 Sh 的工作目录。
+	/// 直接转发 Directory.EnumerateFiles；使用 new LsOptions(Recursive: true) 可遞迴列出所有檔案。
+	/// <example>
+	/// foreach (var FilePath in LsFile("src")) {
+	/// 	Console.WriteLine(FilePath);
+	/// }
+	/// </example>
+	IEnumerable<Pth> LsFile(Pth? Path = null, LsOptions? Options = null);
 
 	/// 讀取檔案為 Content；呼叫方可將結果隱式視為 string 或普通 Stream。
 	Content Read(Pth Path);
@@ -350,6 +495,43 @@ IAsyncEnumerable<FileSystemInfo> Glob(Pth Pattern, CT Ct);
 
 	/// 以字串路徑非同步追加檔案內容；Ct 必須作為最後一個位置參數傳入。
 	Task<nil> Append(str Path, Content Source, CT Ct);
+
+	/// 將一個檔案複製至既有目的地規則所解析出的目標位置。
+	private partial Task CopyFile(str Source, str Destination, bool Overwrite, CT Ct);
+
+	/// 遞迴複製一個目錄樹，並依 Overwrite 決定衝突處理方式。
+	private partial Task CopyDirectory(str Source, str Destination, bool Overwrite, CT Ct);
+
+	/// 複製 glob 匹配的每個項目至目的地。
+	private partial Task CopyMatches(str Source, str Destination, bool Overwrite, CT Ct);
+
+	/// 將來源目錄內容合併至目的目錄，並依 Overwrite 決定檔案衝突處理方式。
+	private partial Task CopyDirectoryMerge(str Source, str Destination, bool Overwrite, CT Ct);
+
+	/// 判斷路徑是否含有 Cssh 支援的 glob 萬用字元。
+	private partial bool HasGlob(str Path);
+
+	/// 取得傳給第三方 Glob 的搜尋根目錄，使相對模式不會以 .. 開頭。
+	/// IsDirectoryPattern 保留原始輸入的尾隨分隔符語義，因為 Path.GetRelativePath 會將其移除。
+	private partial str GetGlobSearchRoot(str FullPattern, bool IsDirectoryPattern);
+
+	/// 取得 glob 萬用字元前的靜態目錄，供來源／目的地重疊檢查使用。
+	private partial str GetGlobSourceRoot(str FullPattern);
+
+	/// 按目的地是否為目錄，解析來源項目的最終目的路徑。
+	private partial str ResolveDestinationPath(str SourcePath, str DestinationPath);
+
+	/// 在複製或移動開始前拒絕來源與目的地相同或互相包含的危險路徑。
+	private partial void ValidateSourceAndDestination(str SourcePath, str DestinationPath, bool SourceIsDirectory);
+
+	/// 判斷 Candidate 是否等於 Root 或位於 Root 目錄之下。
+	private static partial bool IsSameOrDescendantPath(str Root, str Candidate);
+
+	/// 建立所有 Ls 系列共用的 BCL 列舉選項，保留可列舉的隱藏和系統項目。
+	private partial EnumerationOptions MkLsEnumerationOptions(LsOptions? Options);
+
+	/// 在建立檔案前確保其父目錄存在。
+	private partial void EnsureParentDirectory(str FileSystemPath);
 }
 namespace Tsinswreng.CsSh;
 
@@ -484,6 +666,9 @@ class Sh{
 	/// 新程式優先使用 Args 列表重載；Q 適用於保留 Bash 風格命令字串的腳本。
 	str Q(str Value);
 
+	/// 合併目前進程環境與命令設定指定的覆寫項目，建立命令啟動時使用的環境快照。
+	private partial IReadOnlyDictionary<str, str> SnapshotEnvironment(CommandOptions Options);
+
 	/// 非同步地将 Source 复制到 Target。
 	/// 读取命令的 Result.Stdout 或 Result.Stderr 会触发命令执行；Source 结束时不会关闭调用方提供的 Target。
 	void Write(Content Target, Content Source);
@@ -497,6 +682,9 @@ class Sh{
 
 	/// 非同步合并多条 Source 流并写入同一 Target；Ct 必须作为最后一个位置参数传入。
 	Task<nil> Write(Content Target, IReadOnlyList<Content> Sources, CT Ct);
+
+	/// 將 CsSh 路徑表示統一為正斜線，不進行絕對化或檔案系統存取。
+	static str NormalizePath(str Path);
 }
 namespace Tsinswreng.CsSh;
 
@@ -552,12 +740,19 @@ static class ShGlobal{
 	static Task<nil> Mv(Pth Source, Pth Destination, MvOptions? Options, CT Ct);
 	static Pth BaseName(Pth Path);
 	static Pth DirName(Pth Path);
-	static Pth RealPath(Pth Path);
-	static IEnumerable<FileSystemInfo> Glob(Pth Pattern);
-	static IAsyncEnumerable<FileSystemInfo> Glob(Pth Pattern, CT Ct);
-	static IEnumerable<FileSystemInfo> Ls(Pth? Path = null, LsOptions? Options = null);
-	static IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, CT Ct);
-	static IAsyncEnumerable<FileSystemInfo> Ls(Pth? Path, LsOptions? Options, CT Ct);
+	static Pth FullPath(Pth Path);
+	/// 在預設 Sh 的目前工作目錄下惰性列舉 Glob 模式；不以 / 結尾匹配檔案，以 / 結尾匹配目錄。
+	/// 例如 foreach (var FilePath in Glob("src/**/*.cs")) { Console.WriteLine(FilePath); }。
+	static IEnumerable<Pth> Glob(Pth Pattern);
+	/// 在預設 Sh 的目前工作目錄下惰性列舉檔案與目錄路徑；Path 為 null 時列舉目前工作目錄。
+	/// 例如 foreach (var EntryPath in Ls("artifacts")) { Console.WriteLine(EntryPath); }。
+	static IEnumerable<Pth> Ls(Pth? Path = null, LsOptions? Options = null);
+	/// 在預設 Sh 的目前工作目錄下惰性列舉目錄路徑；傳入 new LsOptions(Recursive: true) 可遞迴。
+	/// 例如 foreach (var DirectoryPath in LsDir("src")) { Console.WriteLine(DirectoryPath); }。
+	static IEnumerable<Pth> LsDir(Pth? Path = null, LsOptions? Options = null);
+	/// 在預設 Sh 的目前工作目錄下惰性列舉檔案路徑；傳入 new LsOptions(Recursive: true) 可遞迴。
+	/// 例如 foreach (var FilePath in LsFile("src")) { Console.WriteLine(FilePath); }。
+	static IEnumerable<Pth> LsFile(Pth? Path = null, LsOptions? Options = null);
 	static Content Read(Pth Path);
 	static Task<Content> Read(Pth Path, CT Ct);
 	static void Write(Pth Path, Content Source);
@@ -574,7 +769,7 @@ static class ShGlobal{
 ## 在csx腳本使用CsSh時 開頭寫法示例
 
 ```cs
-#r "nuget: Tsinswreng.CsSh, 0.1.0-alpha"
+#r "nuget: Tsinswreng.CsSh, 0.3.0-alpha"
 #nullable enable
 using Tsinswreng.CsSh;
 using static Tsinswreng.CsSh.ShGlobal;
@@ -587,3 +782,7 @@ CT Ct = default;
 ## 注意事項
 
 - 文件IO異步優先。立即可出結果的(如`IsDir` `IsFile` )不用異步
+- 避免自造輪子。優先用現成封裝好的
+- 腳本不應依賴pwd,
+  - 優先用`CsxDir()`(僅在csx中有效)或`[CallerPath]`(在普通.cs中使用)來定位
+  - 確保不論pwd在何處, 執行腳本都不影響結果
