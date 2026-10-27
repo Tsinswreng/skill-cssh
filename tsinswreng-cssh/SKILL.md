@@ -19,36 +19,36 @@ namespace Tsinswreng.CsSh;
 /// 一条尚未启动的外部命令。
 /// Cmd 创建该对象不会执行进程；首次异步读取 Result.Stdout、Result.Stderr，或等待 Done 时才启动一次。
 /// 命令实现会同时排空 stdout 与 stderr，防止调用方暂未消费其中一条流时造成子进程 pipe 阻塞。
-public sealed partial class Command:IDisposable,IAsyncDisposable{
+sealed class Command:IDisposable,IAsyncDisposable{
 	/// 未指定 CommandOptions.PipeBufferSizeBytes 時，每一條 stdout 或 stderr Pipe 使用的預設容量。
 	/// 此值限制每條輸出在消費者尚未讀取時可暫存的資料量；兩條 Pipe 各自使用此容量。
-	public const i64 DefaultPipeBufferSizeBytes = 64 * 1024;
+	const i64 DefaultPipeBufferSizeBytes = 64 * 1024;
 
 	/// 建立命令時凍結的可執行檔、參數、工作目錄、環境、標準流與錯誤策略。
-	public readonly CommandRunOptions Options;
+	readonly CommandRunOptions Options;
 	/// 接收子程序標準輸出的暫存管線；讀取 Result.Stdout 時由此取得資料。
-	public readonly Pipe StdoutPipe;
+	readonly Pipe StdoutPipe;
 	/// 接收子程序標準錯誤的暫存管線；讀取 Result.Stderr 時由此取得資料。
-	public readonly Pipe StderrPipe;
+	readonly Pipe StderrPipe;
 	/// 儲存唯一的命令退出結果或執行例外，避免多個觀察者重複完成任務。
-	public readonly TaskCompletionSource<CommandExit> ExitSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
+	readonly TaskCompletionSource<CommandExit> ExitSource = new(TaskCreationOptions.RunContinuationsAsynchronously);
 	/// 保護啟動、釋放與 Process 欄位的同步鎖，避免命令被並行啟動或釋放。
-	public readonly object Gate = new();
+	readonly object Gate = new();
 	/// 唯一的背景啟動工作；null 代表命令尚未被觀察，因而尚未啟動。
-	public Task? StartTask;
+	Task? StartTask;
 	/// 已啟動的 .NET Process；完成或釋放後設為 null，避免持有原生控制代碼。
-	public Process? Process;
+	Process? Process;
 	/// 標示 Command 已釋放；釋放後不得再啟動新的子程序。
-	public bool IsDisposed;
+	bool IsDisposed;
 	/// 僅供 Sh 以完整執行配置建立命令。
 	Command(CommandRunOptions Options);
 
 	/// 命令产生的两条标准输出流。
-	public CommandResult Result{get;}
+	CommandResult Result{get;}
 
 	/// 等待子进程退出并取得退出结果。
 	/// Cmd 创建的命令以非零退出码结束时，此任务抛出 CommandFailedException；TryCmd 创建的命令始终返回结果。
-	public Task<CommandExit> Done{
+	Task<CommandExit> Done{
 		get{
 			EnsureStarted();
 			return ExitTask;
@@ -56,7 +56,7 @@ public sealed partial class Command:IDisposable,IAsyncDisposable{
 	}
 
 	/// 尚未觀察命令時也可被釋放；實作以此欄位保存唯一的退出工作。
-	public readonly Task<CommandExit> ExitTask;
+	readonly Task<CommandExit> ExitTask;
 
 	/// 让 await Command 等价于 await Command.Done。
 	/// 等待该对象会启动命令，但不会自动转送 Result 中的输出；要转送时使用 Out。
@@ -86,46 +86,11 @@ public sealed partial class Command:IDisposable,IAsyncDisposable{
 	/// 异步释放结果流的临时资源；进程尚未结束时同时终止该进程。
 	ValueTask DisposeAsync();
 
-	/// 同時讀取 stdout 與 stderr，並將各資料區塊序列化寫入同一目標。
-	private partial Task<CommandExit> OutMerged(Content Target, CT Ct);
-
-	/// 確保命令只會啟動一次；由結果資料流的讀取包裝呼叫。
-	internal partial void EnsureStarted();
-
-	/// 啟動外部進程、轉送各條資料流並完成退出結果。
-	private partial Task Start();
-
-	/// 根據命令執行設定建立不經 Shell 解譯的 ProcessStartInfo。
-	private partial ProcessStartInfo MakeStartInfo();
-
-	/// 將可選標準輸入來源複製至已啟動進程。
-	private partial Task CopyInput(Process Process);
-
-	/// 確保標準輸入在正常完成或失敗時都被關閉，讓子進程能觀察到 EOF。
-	private partial Task CloseInput(Process Process);
-
-	/// 將一條 Content 資料流複製至目標。
-	private static partial Task Write(Content Target, Content Source, CT Ct);
-
-	/// 同時讀取多條來源，並以每個資料區塊為單位序列化寫入同一目標。
-	private static partial Task WriteMerged(Content Target, IReadOnlyList<Content> Sources, CT Ct);
-
-	/// 依指定的單條 Pipe 容量建立具備背壓的 PipeOptions。
-	private static partial PipeOptions MkPipeOptions(i64? PipeBufferSizeBytes);
-
-	/// 完成 stdout 與 stderr 管線，並將啟動或轉送失敗傳遞給讀取端。
-	private partial Task CompletePipes(Exception? Error = null);
-
-	/// 終止仍在執行中的子進程。
-	private partial void TryKill();
-
-	/// 釋放已建立的 Process 控制代碼；輸出管線完成後才可呼叫。
-	private partial void DisposeProcess();
 }
 
 /// 建立 Command 時的可選配置。
 /// 每個設定只影響本次命令；不會改變 Sh 實例或目前程序的全域狀態。
-public sealed record CommandOptions(
+sealed record CommandOptions(
 	/// 子程序的標準輸入來源；null 代表不重定向 stdin，子程序沿用宿主程序的標準輸入。
 	Content? Stdin = null,
 	/// 子程序工作目錄；null 時使用建立此 Command 的 Sh 目前工作目錄。
@@ -138,7 +103,7 @@ public sealed record CommandOptions(
 
 /// Command 的內部執行配置。
 /// 此 record 在建立 Command 時完成快照，避免呼叫端在命令啟動前修改參數或環境集合而改變行為。
-public sealed record CommandRunOptions(
+sealed record CommandRunOptions(
 	/// 要啟動的可執行檔名稱或路徑；不經由 Shell 字串解析。
 	str Exe,
 	/// 子程序參數；每個元素是一個完整參數，會直接加入 ProcessStartInfo.ArgumentList。
@@ -160,7 +125,7 @@ public sealed record CommandRunOptions(
 
 /// Command 产生的标准输出。
 /// 两条 Stream 均为只读、惰性流：首次 ReadAsync 会启动所属命令；数据边产生边可读，不预先全部载入内存。
-public sealed record CommandResult(
+sealed record CommandResult(
 	/// 子程序標準輸出；只能按 Stream 的一次性消費規則讀取。
 	Content Stdout,
 	/// 子程序標準錯誤；只能按 Stream 的一次性消費規則讀取。
@@ -168,7 +133,7 @@ public sealed record CommandResult(
 
 /// 完整消費命令文字輸出後取得的結構化結果。
 /// Stdout 與 Stderr 各自保留，Exit 保留退出碼、耗時與成功狀態。
-public sealed record CommandTextResult(
+sealed record CommandTextResult(
 	/// 完整消費 stdout 後以文字解碼得到的內容；只適合有限大小輸出。
 	str Stdout,
 	/// 完整消費 stderr 後以文字解碼得到的內容；只適合有限大小輸出。
@@ -177,7 +142,7 @@ public sealed record CommandTextResult(
 	CommandExit Exit);
 
 /// 子进程退出后的结构化结果。
-public sealed record CommandExit(
+sealed record CommandExit(
 	/// 子程序回報的原始退出碼；0 代表成功。
 	i32 ExitCode,
 	/// 從 Process.Start 成功到子程序退出的耗時。
@@ -186,9 +151,9 @@ public sealed record CommandExit(
 	bool IsSuccess);
 
 /// Sh.Cmd 遇到非零退出码时抛出的异常。
-public sealed partial class CommandFailedException:Exception{
+sealed class CommandFailedException:Exception{
 	/// 失败命令退出时的结果。
-	public CommandExit Exit{get;}
+	CommandExit Exit{get;}
 
 	/// 由失败命令及执行结果创建异常。
 	CommandFailedException(CommandExit Exit);
@@ -197,39 +162,7 @@ namespace Tsinswreng.CsSh;
 
 /// 讀取前啟動所屬 Command 的只讀 Stream 包裝。
 /// 包裝不緩衝資料，讀取會直接進入 PipeReader 對應的非同步 Stream。
-internal sealed partial class CommandReadStream:Stream{
-	/// 實際承載命令輸出資料的 PipeReader Stream。
-	private readonly Stream Inner;
-	/// 首次讀取時啟動所屬命令的回呼。
-	private readonly Action Start;
 
-	/// 建立資料流包裝；不會立即啟動命令。
-	internal partial CommandReadStream(Stream Inner, Action Start);
-
-	public override bool CanRead => Inner.CanRead;
-	public override bool CanSeek => false;
-	public override bool CanWrite => false;
-	public override long Length => throw new NotSupportedException();
-	public override long Position{get => throw new NotSupportedException(); set => throw new NotSupportedException();}
-	/// 此唯讀資料流不支援同步 Flush。
-	public override partial void Flush();
-	/// 此唯讀資料流不支援非同步 Flush。
-	public override partial Task FlushAsync(CT Ct);
-	/// 啟動命令後讀取同步資料。
-	public override partial i32 Read(byte[] Buffer, i32 Offset, i32 Count);
-	/// 啟動命令後讀取同步資料。
-	public override partial i32 Read(Span<byte> Buffer);
-	/// 啟動命令後讀取非同步資料。
-	public override partial Task<i32> ReadAsync(byte[] Buffer, i32 Offset, i32 Count, CT Ct);
-	/// 啟動命令後讀取非同步資料。
-	public override partial ValueTask<i32> ReadAsync(Memory<byte> Buffer, CT Ct = default);
-	/// 此資料流不支援定位。
-	public override partial long Seek(long Offset, SeekOrigin Origin);
-	/// 此資料流不支援改變長度。
-	public override partial void SetLength(long Value);
-	/// 此資料流不支援寫入。
-	public override partial void Write(byte[] Buffer, i32 Offset, i32 Count);
-}
 using System.Text;
 
 namespace Tsinswreng.CsSh;
@@ -238,41 +171,39 @@ namespace Tsinswreng.CsSh;
 /// 一個 Content 包裝一條可讀或可寫的資料流；它可由文字或普通 Stream 隱式建立，
 /// 因此檔案、命令與標準輸入輸出 API 都只需要處理 Content。
 /// Content 是一次性資料：轉成 string、讀取其 Stream，或作為 Write 的來源都會推進底層位置。
-public sealed partial class Content:IDisposable,IAsyncDisposable{
+sealed class Content:IDisposable,IAsyncDisposable{
 	/// 此 Content 所包裝的普通 .NET Stream。
 	/// 取得它不複製資料，也不重設目前讀寫位置。
-	public Stream Stream{get;}
+	Stream Stream{get;}
 
 	/// 建立時的文字編碼與底層 Stream 所有權設定。
-	public ContentOptions Options{get;}
+	ContentOptions Options{get;}
 
-	/// First text consumption is shared by synchronous and asynchronous callers.
-	private Task<str>? TextTask;
 
 	/// 從普通 .NET Stream 建立 Content。
 	Content(Stream Stream, ContentOptions? Options = null);
 
 	/// 將文字編碼為 Content；預設 UTF-8。
-	public static implicit operator Content(str Text) {
+	static implicit operator Content(str Text) {
 		ArgumentNullException.ThrowIfNull(Text);
 		var Bytes = Encoding.UTF8.GetBytes(Text);
 		return new(new MemoryStream(Bytes, writable: false), new(LeaveOpen: false));
 	}
 
 	/// 將普通 .NET Stream 包裝為 Content，不預先讀取或複製資料。
-	public static implicit operator Content(Stream Stream) {
+	static implicit operator Content(Stream Stream) {
 		return new(Stream);
 	}
 
 	/// 同步讀完 Content 並按設定編碼解碼為文字。
 	/// 這會消費 Content；需要非同步讀取時使用 Text(Ct)。
-	public static implicit operator str(Content Value) {
+	static implicit operator str(Content Value) {
 		ArgumentNullException.ThrowIfNull(Value);
 		return Value.Text();
 	}
 
 	/// 取出 Content 的底層普通 Stream，不複製資料。
-	public static implicit operator Stream(Content Value) {
+	static implicit operator Stream(Content Value) {
 		ArgumentNullException.ThrowIfNull(Value);
 		return Value.Stream;
 	}
@@ -289,19 +220,13 @@ public sealed partial class Content:IDisposable,IAsyncDisposable{
 	/// 非同步釋放 Content 擁有的底層資源；不擁有的外部 Stream 不會被關閉。
 	ValueTask DisposeAsync();
 
-	/// 取得唯一的文字讀取工作，確保同步與非同步讀取共用同一次 Stream 消費。
-	private partial Task<str> GetTextTask(CT Ct);
 
-	/// 非同步讀取並解碼底層資料流。
-	private partial Task<str> ReadText(CT Ct);
 
-	/// 在建立文字讀取器前驗證底層資料流可讀。
-	private partial void EnsureReadable();
 }
 
 /// Content 的建立選項。
 /// Encoding 控制 string 與 Content 的互轉；LeaveOpen 為 true 時 Content 釋放後保留呼叫方提供的 Stream。
-public sealed record ContentOptions(
+sealed record ContentOptions(
 	Encoding? Encoding = null,
 	bool LeaveOpen = true);
 namespace Tsinswreng.CsSh;
@@ -321,12 +246,12 @@ namespace Tsinswreng.CsSh;
 
 /// Adds the path-join operator to ordinary strings for Cssh scripts.
 /// The result always uses forward slashes, so it can be supplied unchanged to every Cssh path API.
-public static class ExtnString{
+static class ExtnString{
 	/// Extends string without introducing a wrapper type at script call sites.
 	extension(str z){
 		/// Joins two path segments without duplicating the separator at their boundary.
 		/// An empty segment is ignored; a leading slash in B is treated as a separator rather than a new rooted path.
-		public static Pth operator /(str A, str B){
+		static Pth operator /(str A, str B){
 			return Pth.Join(A, B);
 		}
 	}
@@ -334,16 +259,16 @@ public static class ExtnString{
 namespace Tsinswreng.CsSh;
 
 /// Cp 的可选行为。
-public sealed record CpOptions(
+sealed record CpOptions(
 	bool Overwrite = false);
 
 /// Mv 的可选行为。
-public sealed record MvOptions(
+sealed record MvOptions(
 	bool Overwrite = false);
 
 /// Ls、LsDir 與 LsFile 的可选行为。
 /// Recursive 為 false 時只列出直接子項；為 true 時遞迴列出所有後代項目。
-public sealed record LsOptions(
+sealed record LsOptions(
 	bool Recursive = false);
 
 /// 供 csx 构建脚本直接静态导入的文件系统动词。
@@ -495,76 +420,35 @@ class Sh{
 
 	/// 以字串路徑非同步追加檔案內容；Ct 必須作為最後一個位置參數傳入。
 	Task<nil> Append(str Path, Content Source, CT Ct);
-
-	/// 將一個檔案複製至既有目的地規則所解析出的目標位置。
-	private partial Task CopyFile(str Source, str Destination, bool Overwrite, CT Ct);
-
-	/// 遞迴複製一個目錄樹，並依 Overwrite 決定衝突處理方式。
-	private partial Task CopyDirectory(str Source, str Destination, bool Overwrite, CT Ct);
-
-	/// 複製 glob 匹配的每個項目至目的地。
-	private partial Task CopyMatches(str Source, str Destination, bool Overwrite, CT Ct);
-
-	/// 將來源目錄內容合併至目的目錄，並依 Overwrite 決定檔案衝突處理方式。
-	private partial Task CopyDirectoryMerge(str Source, str Destination, bool Overwrite, CT Ct);
-
-	/// 判斷路徑是否含有 Cssh 支援的 glob 萬用字元。
-	private partial bool HasGlob(str Path);
-
-	/// 取得傳給第三方 Glob 的搜尋根目錄，使相對模式不會以 .. 開頭。
-	/// IsDirectoryPattern 保留原始輸入的尾隨分隔符語義，因為 Path.GetRelativePath 會將其移除。
-	private partial str GetGlobSearchRoot(str FullPattern, bool IsDirectoryPattern);
-
-	/// 取得 glob 萬用字元前的靜態目錄，供來源／目的地重疊檢查使用。
-	private partial str GetGlobSourceRoot(str FullPattern);
-
-	/// 按目的地是否為目錄，解析來源項目的最終目的路徑。
-	private partial str ResolveDestinationPath(str SourcePath, str DestinationPath);
-
-	/// 在複製或移動開始前拒絕來源與目的地相同或互相包含的危險路徑。
-	private partial void ValidateSourceAndDestination(str SourcePath, str DestinationPath, bool SourceIsDirectory);
-
-	/// 判斷 Candidate 是否等於 Root 或位於 Root 目錄之下。
-	private static partial bool IsSameOrDescendantPath(str Root, str Candidate);
-
-	/// 建立所有 Ls 系列共用的 BCL 列舉選項，保留可列舉的隱藏和系統項目。
-	private partial EnumerationOptions MkLsEnumerationOptions(LsOptions? Options);
-
-	/// 在建立檔案前確保其父目錄存在。
-	private partial void EnsureParentDirectory(str FileSystemPath);
 }
 namespace Tsinswreng.CsSh;
 
 /// 表示供 Cssh API 使用的檔案系統路徑。
 /// 此類型保留與 string 的隱式互轉，以維持腳本中既有的字面量呼叫方式。
-public readonly partial struct Pth{
+readonly struct Pth{
 	/// 路徑的原始字串值。
-	public str Value{get;}
+	str Value{get;}
 
 	/// 以原始字串建立路徑。
 	Pth(str Value);
 
 	/// 取得供 BCL 與一般文字 API 使用的原始路徑值。
-	/// C# 不支援 partial conversion operator，故此處僅作語法層轉發。
-	public static implicit operator str(Pth z) {
+	static implicit operator str(Pth z) {
 		return z.Value;
 	}
 
 	/// 讓既有字串字面量可直接傳入 Cssh 的路徑 API。
-	/// C# 不支援 partial conversion operator，故此處僅轉發至已分離的建構子。
-	public static implicit operator Pth(str z) {
+	static implicit operator Pth(str z) {
 		return new Pth(z);
 	}
 
 	/// 將右側路徑片段附加到目前路徑，並統一使用正斜線。
-	/// C# 不支援 partial operator，故此處僅轉發至已分離的 Join。
-	public static Pth operator /(Pth A, str B) {
+	static Pth operator /(Pth A, str B) {
 		return Join(A.Value, B);
 	}
 
 	/// 將兩個路徑附加為一條 Cssh 路徑。
-	/// C# 不支援 partial operator，故此處僅轉發至已分離的 Join。
-	public static Pth operator /(Pth A, Pth B) {
+	static Pth operator /(Pth A, Pth B) {
 		return Join(A.Value, B.Value);
 	}
 
@@ -572,7 +456,7 @@ public readonly partial struct Pth{
 	static Pth Join(str A, str B);
 
 	/// 以原始路徑值表示此實例，供記錄與插值字串使用。
-	public override partial str ToString();
+	override str ToString();
 }
 namespace Tsinswreng.CsSh;
 
@@ -583,16 +467,16 @@ class Sh{
 	Sh();
 
 	/// 当前脚本进程的标准输入内容。
-	public Content Stdin{get;}
+	Content Stdin{get;}
 
 	/// 当前脚本进程的标准输出内容。
-	public Content Stdout{get;}
+	Content Stdout{get;}
 
 	/// 当前脚本进程的标准错误内容。
-	public Content Stderr{get;}
+	Content Stderr{get;}
 
 	/// 跨平台的空内容目标，等价于 Bash 的 /dev/null 或 Windows 的 NUL。
-	public Content Null{get;}
+	Content Null{get;}
 
 	/// 取得当前进程的工作目录。
 	/// 返回路径统一使用正斜杠，因而可直接与 Cssh 的所有路径 API 拼接。
@@ -666,8 +550,6 @@ class Sh{
 	/// 新程式優先使用 Args 列表重載；Q 適用於保留 Bash 風格命令字串的腳本。
 	str Q(str Value);
 
-	/// 合併目前進程環境與命令設定指定的覆寫項目，建立命令啟動時使用的環境快照。
-	private partial IReadOnlyDictionary<str, str> SnapshotEnvironment(CommandOptions Options);
 
 	/// 非同步地将 Source 复制到 Target。
 	/// 读取命令的 Result.Stdout 或 Result.Stderr 会触发命令执行；Source 结束时不会关闭调用方提供的 Target。
@@ -690,7 +572,7 @@ namespace Tsinswreng.CsSh;
 
 /// 全局默认 Shell 实例的静态 facade，供 csx 使用 using static 简化调用。
 static class ShGlobal{
-	public static Sh Sh{get;set;} = new();
+	static Sh Sh{get;set;} = new();
 	static Pth Pwd();
 	static Pth CsxDir();
 	static void Echo(str Text);

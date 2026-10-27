@@ -16,7 +16,7 @@ description: cssh庫使用說明。用于編寫dotnet-script/csx腳本
 
 	#raw(
 		read(
-			"Api.txt",
+			"Api.cs",
 		),
 		lang: "cs",
 		block: true,
