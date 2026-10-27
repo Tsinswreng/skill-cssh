@@ -668,3 +668,4 @@ CT Ct = default;
 - 腳本不應依賴pwd,
   - 優先用`CsxDir()`(僅在csx中有效)或`[CallerPath]`(在普通.cs中使用)來定位
   - 確保不論pwd在何處, 執行腳本都不影響結果
+- 能寫`new()`的就不要寫`new 類型名()`, 尤其是傳那幾個`XxxOptions`之時

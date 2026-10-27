@@ -45,4 +45,5 @@ description: cssh庫使用說明。用于編寫dotnet-script/csx腳本
 		- #[確保不論pwd在何處,
 			執行腳本都不影響結果]
 	]
+	- #[能寫`new()`的就不要寫`new 類型名()`, 尤其是傳那幾個`XxxOptions`之時]
 ]
