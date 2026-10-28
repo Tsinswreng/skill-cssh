@@ -9,7 +9,7 @@ namespace Tsinswreng.CsSh;
 sealed class Command:IDisposable,IAsyncDisposable{
 	/// 未指定 CommandOptions.PipeBufferSizeBytes 時，每一條 stdout 或 stderr Pipe 使用的預設容量。
 	/// 此值限制每條輸出在消費者尚未讀取時可暫存的資料量；兩條 Pipe 各自使用此容量。
-	const i64 DefaultPipeBufferSizeBytes = 64 * 1024;
+	const long DefaultPipeBufferSizeBytes = 64 * 1024;
 
 	/// 建立命令時凍結的可執行檔、參數、工作目錄、環境、標準流與錯誤策略。
 	readonly CommandRunOptions Options;
@@ -83,24 +83,24 @@ sealed record CommandOptions(
 	/// 子程序工作目錄；null 時使用建立此 Command 的 Sh 目前工作目錄。
 	Pth? Cwd = null,
 	/// 僅套用於子程序的環境變數覆寫；鍵的值為 null 時從子程序環境移除該鍵。
-	IReadOnlyDictionary<str, str?>? Env = null,
+	IReadOnlyDictionary<string, string?>? Env = null,
 	/// 每一條 stdout 或 stderr Pipe 的最大暫存位元組數；null 時使用 Command.DefaultPipeBufferSizeBytes。
 	/// 此值必須大於 0；Pipe 滿時會以背壓暫停上游輸出，而非無限制佔用記憶體。
-	i64? PipeBufferSizeBytes = null);
+	long? PipeBufferSizeBytes = null);
 
 /// Command 的內部執行配置。
 /// 此 record 在建立 Command 時完成快照，避免呼叫端在命令啟動前修改參數或環境集合而改變行為。
 sealed record CommandRunOptions(
 	/// 要啟動的可執行檔名稱或路徑；不經由 Shell 字串解析。
-	str Exe,
+	string Exe,
 	/// 子程序參數；每個元素是一個完整參數，會直接加入 ProcessStartInfo.ArgumentList。
-	IReadOnlyList<str> Args,
+	IReadOnlyList<string> Args,
 	/// 呼叫端提供的選用設定；保留 stdin 來源與原始選項供命令生命週期使用。
 	CommandOptions Options,
 	/// 已展開為絕對路徑的子程序工作目錄。
 	Pth Cwd,
 	/// 建立命令當下取得的子程序環境快照；不會受後續宿主環境變更影響。
-	IReadOnlyDictionary<str, str> Environment,
+	IReadOnlyDictionary<string, string> Environment,
 	/// Exe 或 Command.Out() 未指定目標時接收子程序 stdout 的預設 Content。
 	Content Stdout,
 	/// Exe 或 Command.Out() 未指定目標時接收子程序 stderr 的預設 Content。
@@ -122,16 +122,16 @@ sealed record CommandResult(
 /// Stdout 與 Stderr 各自保留，Exit 保留退出碼、耗時與成功狀態。
 sealed record CommandTextResult(
 	/// 完整消費 stdout 後以文字解碼得到的內容；只適合有限大小輸出。
-	str Stdout,
+	string Stdout,
 	/// 完整消費 stderr 後以文字解碼得到的內容；只適合有限大小輸出。
-	str Stderr,
+	string Stderr,
 	/// 命令退出碼、耗時及成功狀態。
 	CommandExit Exit);
 
 /// 子进程退出后的结构化结果。
 sealed record CommandExit(
 	/// 子程序回報的原始退出碼；0 代表成功。
-	i32 ExitCode,
+	int ExitCode,
 	/// 從 Process.Start 成功到子程序退出的耗時。
 	TimeSpan Duration,
 	/// ExitCode 是否為 0 的便利判斷值。
@@ -171,7 +171,7 @@ sealed class Content:IDisposable,IAsyncDisposable{
 	Content(Stream Stream, ContentOptions? Options = null);
 
 	/// 將文字編碼為 Content；預設 UTF-8。
-	static implicit operator Content(str Text) {
+	static implicit operator Content(string Text) {
 		ArgumentNullException.ThrowIfNull(Text);
 		var Bytes = Encoding.UTF8.GetBytes(Text);
 		return new(new MemoryStream(Bytes, writable: false), new(LeaveOpen: false));
@@ -184,7 +184,7 @@ sealed class Content:IDisposable,IAsyncDisposable{
 
 	/// 同步讀完 Content 並按設定編碼解碼為文字。
 	/// 這會消費 Content；需要非同步讀取時使用 Text(Ct)。
-	static implicit operator str(Content Value) {
+	static implicit operator string(Content Value) {
 		ArgumentNullException.ThrowIfNull(Value);
 		return Value.Text();
 	}
@@ -196,10 +196,10 @@ sealed class Content:IDisposable,IAsyncDisposable{
 	}
 
 	/// 同步讀完並解碼為文字。
-	str Text();
+	string Text();
 
 	/// 非同步讀完並解碼為文字；Ct 必須作為最後一個位置參數傳入。
-	Task<str> Text(CT Ct);
+	Task<string> Text(CT Ct);
 
 	/// 釋放 Content 擁有的底層資源；不擁有的外部 Stream 不會被關閉。
 	void Dispose();
@@ -220,14 +220,14 @@ namespace Tsinswreng.CsSh;
 
 class Sh{
 	/// 取得当前进程的环境变量；不存在时返回 null。
-	str? GetEnv(str Name);
+	string? GetEnv(string Name);
 
 	/// 设置当前进程的环境变量。
 	/// 若只需影响一次外部调用，应在创建 X 命令时传入专用环境变量设置，避免污染脚本后续步骤。
-	void SetEnv(str Name, str Value);
+	void SetEnv(string Name, string Value);
 
 	/// 从当前进程的环境变量中移除指定名称。
-	void UnsetEnv(str Name);
+	void UnsetEnv(string Name);
 }
 namespace Tsinswreng.CsSh;
 
@@ -235,10 +235,10 @@ namespace Tsinswreng.CsSh;
 /// The result always uses forward slashes, so it can be supplied unchanged to every Cssh path API.
 static class ExtnString{
 	/// Extends string without introducing a wrapper type at script call sites.
-	extension(str z){
+	extension(string z){
 		/// Joins two path segments without duplicating the separator at their boundary.
 		/// An empty segment is ignored; a leading slash in B is treated as a separator rather than a new rooted path.
-		static Pth operator /(str A, str B){
+		static Pth operator /(string A, string B){
 			return Pth.Join(A, B);
 		}
 	}
@@ -387,26 +387,26 @@ class Sh{
 
 	/// 以字串路徑覆寫檔案內容。
 	/// 此重載優先保留 Write("file", "text") 的腳本寫法，避免與 Content 目標寫入重載二義。
-	void Write(str Path, Content Source);
+	void Write(string Path, Content Source);
 
 	/// 非同步覆寫檔案內容；Ct 必須作為最後一個位置參數傳入。
 	Task<nil> Write(Pth Path, Content Source, CT Ct);
 
 	/// 以字串路徑非同步覆寫檔案內容；Ct 必須作為最後一個位置參數傳入。
-	Task<nil> Write(str Path, Content Source, CT Ct);
+	Task<nil> Write(string Path, Content Source, CT Ct);
 
 	/// 追加檔案內容，等價於 >> Path。
 	/// Source 接受 Content；string 與普通 Stream 均可隱式轉入 Content。
 	void Append(Pth Path, Content Source);
 
 	/// 以字串路徑追加檔案內容。
-	void Append(str Path, Content Source);
+	void Append(string Path, Content Source);
 
 	/// 非同步追加檔案內容；Ct 必須作為最後一個位置參數傳入。
 	Task<nil> Append(Pth Path, Content Source, CT Ct);
 
 	/// 以字串路徑非同步追加檔案內容；Ct 必須作為最後一個位置參數傳入。
-	Task<nil> Append(str Path, Content Source, CT Ct);
+	Task<nil> Append(string Path, Content Source, CT Ct);
 }
 namespace Tsinswreng.CsSh;
 
@@ -414,23 +414,23 @@ namespace Tsinswreng.CsSh;
 /// 此類型保留與 string 的隱式互轉，以維持腳本中既有的字面量呼叫方式。
 readonly struct Pth{
 	/// 路徑的原始字串值。
-	str Value{get;}
+	string Value{get;}
 
 	/// 以原始字串建立路徑。
-	Pth(str Value);
+	Pth(string Value);
 
 	/// 取得供 BCL 與一般文字 API 使用的原始路徑值。
-	static implicit operator str(Pth z) {
+	static implicit operator string(Pth z) {
 		return z.Value;
 	}
 
 	/// 讓既有字串字面量可直接傳入 Cssh 的路徑 API。
-	static implicit operator Pth(str z) {
+	static implicit operator Pth(string z) {
 		return new Pth(z);
 	}
 
 	/// 將右側路徑片段附加到目前路徑，並統一使用正斜線。
-	static Pth operator /(Pth A, str B) {
+	static Pth operator /(Pth A, string B) {
 		return Join(A.Value, B);
 	}
 
@@ -440,10 +440,10 @@ readonly struct Pth{
 	}
 
 	/// 對兩段路徑做不改變根語意的字串層級連接。
-	static Pth Join(str A, str B);
+	static Pth Join(string A, string B);
 
 	/// 以原始路徑值表示此實例，供記錄與插值字串使用。
-	override str ToString();
+	override string ToString();
 }
 namespace Tsinswreng.CsSh;
 
@@ -475,10 +475,10 @@ class Sh{
 	Pth CsxDir();
 
 	/// 同步输出一行文本到标准输出，等价于 Bash 的 echo。
-	void Echo(str Text);
+	void Echo(string Text);
 
 	/// 异步输出一行文本到标准输出。
-	Task<nil> Echo(str Text, CT Ct);
+	Task<nil> Echo(string Text, CT Ct);
 
 	/// 切换当前进程的工作目录，等价于 Bash 的 cd。
 	/// Cssh 的所有路径参数均接受正斜杠；例如 Cd("src/app") 在 Windows、Linux 与 macOS 上含义相同。
@@ -486,56 +486,56 @@ class Sh{
 	void Cd(Pth Path);
 
 	/// 建立尚未啟動的命令；Args 的每一項是一個完整參數，不需呼叫方處理引號或跳脫。
-	Command Cmd(str Exe, IList<str> Args);
+	Command Cmd(string Exe, IList<string> Args);
 
 	/// 建立尚未啟動的命令；Args 的每一項是一個完整參數。
-	Command Cmd(str Exe, IList<str> Args, CommandOptions Options);
+	Command Cmd(string Exe, IList<string> Args, CommandOptions Options);
 
 	/// 非同步建立尚未啟動的命令；Ct 必須作為最後一個位置參數。
-	Command Cmd(str Exe, IList<str> Args, CT Ct);
+	Command Cmd(string Exe, IList<string> Args, CT Ct);
 
 	/// 非同步建立尚未啟動的命令；Args 的每一項是一個完整參數，Ct 必須作為最後一個位置參數。
-	Command Cmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+	Command Cmd(string Exe, IList<string> Args, CommandOptions Options, CT Ct);
 
 	/// 建立不因非零退出碼丟例外的命令；Args 的每一項是一個完整參數。
-	Command TryCmd(str Exe, IList<str> Args);
+	Command TryCmd(string Exe, IList<string> Args);
 
 	/// 建立帶可選設定且不因非零退出碼丟例外的命令。
-	Command TryCmd(str Exe, IList<str> Args, CommandOptions Options);
+	Command TryCmd(string Exe, IList<string> Args, CommandOptions Options);
 
 	/// 非同步建立不因非零退出碼丟例外的命令；Ct 必須作為最後一個位置參數。
-	Command TryCmd(str Exe, IList<str> Args, CT Ct);
+	Command TryCmd(string Exe, IList<string> Args, CT Ct);
 
 	/// 非同步建立帶可選設定且不因非零退出碼丟例外的命令；Ct 必須作為最後一個位置參數。
-	Command TryCmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
+	Command TryCmd(string Exe, IList<string> Args, CommandOptions Options, CT Ct);
 
 	/// 執行以參數列表描述的命令；Args 不需呼叫方處理引號或跳脫。
-	CommandExit Exe(str FileName, IList<str> Args);
+	CommandExit Exe(string FileName, IList<string> Args);
 
 	/// 以可選設定執行參數列表命令。
-	CommandExit Exe(str FileName, IList<str> Args, CommandOptions Options);
+	CommandExit Exe(string FileName, IList<string> Args, CommandOptions Options);
 
 	/// 非同步執行參數列表命令；Ct 必須作為最後一個位置參數。
-	Task<CommandExit> Exe(str FileName, IList<str> Args, CT Ct);
+	Task<CommandExit> Exe(string FileName, IList<string> Args, CT Ct);
 
 	/// 非同步以可選設定執行參數列表命令；Ct 必須作為最後一個位置參數。
-	Task<CommandExit> Exe(str FileName, IList<str> Args, CommandOptions Options, CT Ct);
+	Task<CommandExit> Exe(string FileName, IList<string> Args, CommandOptions Options, CT Ct);
 
 	/// 執行參數列表命令；非零退出碼回傳 CommandExit，不丟例外。
-	CommandExit TryExe(str FileName, IList<str> Args);
+	CommandExit TryExe(string FileName, IList<string> Args);
 
 	/// 以可選設定執行參數列表命令；非零退出碼不丟例外。
-	CommandExit TryExe(str FileName, IList<str> Args, CommandOptions Options);
+	CommandExit TryExe(string FileName, IList<string> Args, CommandOptions Options);
 
 	/// 非同步執行參數列表命令；非零退出碼不丟例外。
-	Task<CommandExit> TryExe(str FileName, IList<str> Args, CT Ct);
+	Task<CommandExit> TryExe(string FileName, IList<string> Args, CT Ct);
 
 	/// 非同步以可選設定執行參數列表命令；非零退出碼不丟例外。
-	Task<CommandExit> TryExe(str FileName, IList<str> Args, CommandOptions Options, CT Ct);
+	Task<CommandExit> TryExe(string FileName, IList<string> Args, CommandOptions Options, CT Ct);
 
 	/// 將一個值轉成可嵌入字串命令的單一安全參數。
 	/// 新程式優先使用 Args 列表重載；Q 適用於保留 Bash 風格命令字串的腳本。
-	str Q(str Value);
+	string Q(string Value);
 
 
 	/// 非同步地将 Source 复制到 Target。
@@ -553,7 +553,7 @@ class Sh{
 	Task<nil> Write(Content Target, IReadOnlyList<Content> Sources, CT Ct);
 
 	/// 將 CsSh 路徑表示統一為正斜線，不進行絕對化或檔案系統存取。
-	static str NormalizePath(str Path);
+	static string NormalizePath(string Path);
 }
 namespace Tsinswreng.CsSh;
 
@@ -562,33 +562,33 @@ static class ShGlobal{
 	static Sh Sh{get;set;} = new();
 	static Pth Pwd();
 	static Pth CsxDir();
-	static void Echo(str Text);
-	static Task<nil> Echo(str Text, CT Ct);
+	static void Echo(string Text);
+	static Task<nil> Echo(string Text, CT Ct);
 	static void Cd(Pth Path);
-	static Command Cmd(str Exe, IList<str> Args);
-	static Command Cmd(str Exe, IList<str> Args, CommandOptions Options);
-	static Command Cmd(str Exe, IList<str> Args, CT Ct);
-	static Command Cmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
-	static Command TryCmd(str Exe, IList<str> Args);
-	static Command TryCmd(str Exe, IList<str> Args, CommandOptions Options);
-	static Command TryCmd(str Exe, IList<str> Args, CT Ct);
-	static Command TryCmd(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
-	static CommandExit Exe(str Exe, IList<str> Args);
-	static CommandExit Exe(str Exe, IList<str> Args, CommandOptions Options);
-	static Task<CommandExit> Exe(str Exe, IList<str> Args, CT Ct);
-	static Task<CommandExit> Exe(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
-	static CommandExit TryExe(str Exe, IList<str> Args);
-	static CommandExit TryExe(str Exe, IList<str> Args, CommandOptions Options);
-	static Task<CommandExit> TryExe(str Exe, IList<str> Args, CT Ct);
-	static Task<CommandExit> TryExe(str Exe, IList<str> Args, CommandOptions Options, CT Ct);
-	static str Q(str Value);
+	static Command Cmd(string Exe, IList<string> Args);
+	static Command Cmd(string Exe, IList<string> Args, CommandOptions Options);
+	static Command Cmd(string Exe, IList<string> Args, CT Ct);
+	static Command Cmd(string Exe, IList<string> Args, CommandOptions Options, CT Ct);
+	static Command TryCmd(string Exe, IList<string> Args);
+	static Command TryCmd(string Exe, IList<string> Args, CommandOptions Options);
+	static Command TryCmd(string Exe, IList<string> Args, CT Ct);
+	static Command TryCmd(string Exe, IList<string> Args, CommandOptions Options, CT Ct);
+	static CommandExit Exe(string Exe, IList<string> Args);
+	static CommandExit Exe(string Exe, IList<string> Args, CommandOptions Options);
+	static Task<CommandExit> Exe(string Exe, IList<string> Args, CT Ct);
+	static Task<CommandExit> Exe(string Exe, IList<string> Args, CommandOptions Options, CT Ct);
+	static CommandExit TryExe(string Exe, IList<string> Args);
+	static CommandExit TryExe(string Exe, IList<string> Args, CommandOptions Options);
+	static Task<CommandExit> TryExe(string Exe, IList<string> Args, CT Ct);
+	static Task<CommandExit> TryExe(string Exe, IList<string> Args, CommandOptions Options, CT Ct);
+	static string Q(string Value);
 	static void Write(Content Target, Content Source);
 	static Task<nil> Write(Content Target, Content Source, CT Ct);
 	static void Write(Content Target, IReadOnlyList<Content> Sources);
 	static Task<nil> Write(Content Target, IReadOnlyList<Content> Sources, CT Ct);
-	static str? GetEnv(str Name);
-	static void SetEnv(str Name, str Value);
-	static void UnsetEnv(str Name);
+	static string? GetEnv(string Name);
+	static void SetEnv(string Name, string Value);
+	static void UnsetEnv(string Name);
 	static bool Exists(Pth Path);
 	static Task<bool> Exists(Pth Path, CT Ct);
 	static FileSystemInfo? FsInfo(Pth Path);
@@ -625,11 +625,11 @@ static class ShGlobal{
 	static Content Read(Pth Path);
 	static Task<Content> Read(Pth Path, CT Ct);
 	static void Write(Pth Path, Content Source);
-	static void Write(str Path, Content Source);
+	static void Write(string Path, Content Source);
 	static Task<nil> Write(Pth Path, Content Source, CT Ct);
-	static Task<nil> Write(str Path, Content Source, CT Ct);
+	static Task<nil> Write(string Path, Content Source, CT Ct);
 	static void Append(Pth Path, Content Source);
-	static void Append(str Path, Content Source);
+	static void Append(string Path, Content Source);
 	static Task<nil> Append(Pth Path, Content Source, CT Ct);
-	static Task<nil> Append(str Path, Content Source, CT Ct);
+	static Task<nil> Append(string Path, Content Source, CT Ct);
 }

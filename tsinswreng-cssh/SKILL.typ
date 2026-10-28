@@ -45,5 +45,38 @@ description: cssh庫使用說明。用于編寫dotnet-script/csx腳本
 		- #[確保不論pwd在何處,
 			執行腳本都不影響結果]
 	]
-	- #[能寫`new()`的就不要寫`new 類型名()`, 尤其是傳那幾個`XxxOptions`之時]
+	- #[語法要求
+		- #[能寫`new()`的就不要寫`new 類型名()`, 尤其是傳那幾個`XxxOptions`之時
+			正確示例:
+			````cs
+			await Cp(src, dst, new(Overwrite: true), Ct);
+			````
+		]
+		- #[儘量用更簡單的列表字面量語法。
+			錯誤示例:
+			```cs
+			await Exe("git", new[]{"commit", "-m", "init"}, Ct);
+			```
+			`new List<>{}`同樣不要用
+			
+			正確示例:
+			````cs
+			await Exe("git", ["commit", "-m", "init"], Ct);
+			````
+			]
+		- #[多用C\#文本塊語法,
+		不允許手動轉義。
+		錯誤示例:
+		```cs
+		var LoginJson = $"{{\"username\":\"admin\",\"password\":\"{Password}\"}}"; 
+		```
+		
+		正確示例
+		````cs
+		var LoginJson = $$"""{"username":"admin","password":"{{Password}}"}""";
+		````
+		
+		]
+	]
+	
 ]
