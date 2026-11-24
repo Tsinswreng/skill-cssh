@@ -80,6 +80,37 @@ static async Task<Browser> MkBrowser(CT Ct){
 	- 要復用的變量/函數等
 ]
 
+#H[編譯運行][
+	#H[常規運行][
+		`dotnet-script xxx.csx`
+		或
+		`dotnet script xxx.csx`
+	]
+	
+	#H[無文件 臨時運行][
+	```sh
+dotnet-script eval <<'CSX'
+#r "nuget: Tsinswreng.CsSh, 0.3.0-alpha"
+#nullable enable
+using Tsinswreng.CsSh;
+using static Tsinswreng.CsSh.ShGlobal;
+using CT = System.Threading.CancellationToken;
+CT Ct = default;
+
+//腳本正文...
+Echo($"Hello from CsSh! Current Working Directory is {Pwd()}");
+CSX
+	```
+	]
+	
+	#H[只編譯檢查不運行][
+		`dotnet publish xxx.csx`
+		
+		因爲你只是編譯檢查,
+		所以執行後要刪除編譯產物 防止浪費空間
+	]
+]
+
 #H[注意事項][
 	- #[文件IO異步優先。立即可出結果的(如`IsDir` `IsFile` )不用異步]
 	- #[避免自造輪子。優先用現成封裝好的]
