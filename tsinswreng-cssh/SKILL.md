@@ -86,7 +86,7 @@ var browser = await MkBrowser(Ct);//Ct會隨#load傳播, 不需重複定義
   - 確保不論pwd在何處, 執行腳本都不影響結果
 - 能並行的操作儘量并行, 善用 `Task.WhenAll`等。
 - 語法要求
-  - 拼接路徑用重載的 / 如 `Pwd()/"a/b"`
+  - 拼接路徑用重載的 / 如 `Pwd()/"a/b"`, 禁止用`System.IO.Path.Combine`
   - 能寫`new()`的就不要寫`new 類型名()`, 尤其是傳那幾個`XxxOptions`之時 正確示例:
     ```cs
     await Cp(src, dst, new(Overwrite: true), Ct);

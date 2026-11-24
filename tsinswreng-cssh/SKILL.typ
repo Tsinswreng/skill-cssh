@@ -90,7 +90,9 @@ static async Task<Browser> MkBrowser(CT Ct){
 	]
 	- #[能並行的操作儘量并行, 善用 `Task.WhenAll`等。]
 	- #[語法要求
-		- 拼接路徑用重載的 / 如 `Pwd()/"a/b"`
+		- #[拼接路徑用重載的 / 如 `Pwd()/"a/b"`,
+			禁止用`System.IO.Path.Combine`
+		]
 		- #[能寫`new()`的就不要寫`new 類型名()`, 尤其是傳那幾個`XxxOptions`之時
 			正確示例:
 			````cs
@@ -214,4 +216,9 @@ static class ShGlobal{
 	自己看同目錄下的`Api.cs`文件。
 	註: 爲省字數, 很多`public`修飾符被省略,
 	但實際上這些API仍是public的。
+	
+	// #raw(
+	// 	read("Api.cs"),
+	// 	lang: "cs", block: true
+	// )
 ]
